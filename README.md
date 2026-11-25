@@ -17,6 +17,20 @@ CSV 合并拒收登记和缺陷复检两类记录。批次加单件编号唯一�
 5. 工位顺位复核
 6. 返修清单分发
 
+## 按班次分开交两份原表
+
+拒收单（`reject`，拒收登记行）与复检单（`recheck`，缺陷复检行）分开提交，复检单常先到。以班次编号（`shift`/`code`，如 `20261125-早班`、`TG-1124`）归集：
+
+- 先到的一份立即照收（状态 `collecting`），不要求另一份在场；两份到齐后按 `lot_id + unit_id` 逐件核对，双向查找「复检无拒收」「拒收未复检」以及「复检早于拒收」，每条不符都带 `lot_id`（批次）与 `unit_id`（单件）。
+- 不符时状态为 `mismatch`，按批次/单件提示补交；补交只替换对应那份原表，另一份的 `id`/SHA-256 保持不变（响应含 `kept_form`）。
+- 核对通过（`ready`）才生成整班合并数据版本（先拒收后复检的稳定合并顺序），班次分析与 `POST /runs` 对该版本放行；单独一份原表的数据版本不能直接分析（409），对已通过班次的原表版本提交计算会自动解析到整班合并版本。
+- 整班入库按规范化记录的 SHA-256 去重，重试不新增数据/分析版本；`POST /shifts/{key}/runs|analyze` 用「班次+整班版本+参数」派生幂等键，通用 `POST /runs` 也支持 `Idempotency-Key` 请求头。
+- `POST /shifts/{key}/close`（别名 `seal`/`finish`/`lock`）在同一把班次锁与同一数据库事务内重新核对并入库，保证「核对与入库按同一组原单」完成；并发的补交与封班被串行化。封班后状态 `closed`：相同内容原单重传返回 `200` 与同一版本，内容不同返回 `409`。
+- 页面「终检班次总览」顶部与「拒收与复检台账」顶部均可查「班次进度」，台账页可交单、看批次/单件不符、逐件核对、封班并跳转分析；深链 `#1/shift/{id}`。
+
+主要接口（同时挂在根路径与 `/api` 前缀下）：`GET /shifts`、`GET /shifts/progress`、`GET /shifts/{id或编号}`、`POST /shifts`、`POST /shifts/demo`、`POST|PUT /shifts/{key}/forms[/{kind}]`（也支持 `/reject`、`/recheck`、`/uploads`、`/sheets` 等别名与 multipart 文件）、`POST /shifts/{key}/reconcile`、`POST /shifts/{key}/close`、`POST /shifts/{key}/runs|analyze`。旧的合并 CSV `POST /datasets {name,csv}` 行为保持不变；在其体里额外传 `shift` 与 `kind` 即走班次交单。
+
+
 ## 工作剧本
 
 1. 08:10 终检领班在总览核对 TG-1124-01 至 TG-1124-03 三批拒收记录，三个批次各有 10 件。

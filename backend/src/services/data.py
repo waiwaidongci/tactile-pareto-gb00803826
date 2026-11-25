@@ -77,11 +77,15 @@ def parse_options(values):
     return output
 
 
+def records_checksum(records):
+    payload = json.dumps(records, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 def save_revision(name, records, owner):
     if not name.strip():
         raise ValueError('数据名称不能为空。')
-    payload = json.dumps(records, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
-    checksum = hashlib.sha256(payload.encode()).hexdigest()
+    checksum = records_checksum(records)
     now = time.time()
     existing = select(datasets.c.id).where(datasets.c.checksum == checksum)
     try:

@@ -48,6 +48,14 @@ def allowed(role):
     return check
 
 
+def allowed_any(*roles):
+    def check(account=Depends(signed_in)):
+        if account['role'] not in roles:
+            raise HTTPException(403, '当前角色无权执行此操作。')
+        return account
+    return check
+
+
 def authenticate(username, password):
     with engine.connect() as connection:
         row = connection.execute(select(users).where(users.c.username == username)).mappings().one_or_none()

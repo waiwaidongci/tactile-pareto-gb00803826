@@ -1,6 +1,7 @@
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 
 from src.config.settings import ARTIFACTS
 from src.constants.enums import Role
@@ -9,6 +10,8 @@ from src.models.tables import datasets, runs
 from src.schemas.requests import Delivery, Import, Login, Review, Run
 from src.services.data import PROFILE, csv_records, save_revision
 from src.services.domain import sample_rows
+from src.services.shift_domain import normalize_kind
+from src.services.shifts import submit_form
 from src.services.workflow import add_run, cancel_schedule, review_run, schedule_report
 from src.utils.exports import write_csv
 from src.utils.security import allowed, authenticate, signed_in
@@ -56,9 +59,63 @@ def get_dataset(key: int, account=Depends(signed_in)):
 
 
 @router.post('/datasets', status_code=201)
-def import_data(body: Import, account=Depends(analyst)):
-    rows = csv_records(body.csv)
-    key, created = save_revision(body.name, rows, account['username'])
+def import_data(body: Import, request: Request, account=Depends(analyst)):
+    extra = body.model_dump()
+    shift_ref = body.shift or body.shift_code or body.code or (str(body.shift_id) if body.shift_id else None)
+    kind = normalize_kind(body.kind or body.form_type or body.doc_type or body.type or extra.get('document_type'))
+    records = body.rows or body.records or extra.get('rows') or extra.get('records')
+    csv_text = body.csv
+    if not csv_text:
+        for key in ('content', 'csv_text', 'text', 'data', 'file_content', 'body'):
+            value = extra.get(key)
+            if isinstance(value, str) and value.strip():
+                csv_text = value
+                break
+
+    # 新流程：/datasets 同时兼容“按班次分开交两份原表”。kind 可省略，按记录类型自动识别/拆分。
+    if shift_ref:
+        view, status_code = submit_form(
+            str(shift_ref), kind, csv_text=csv_text, records=records,
+            filename=(body.name or extra.get('filename') or None), actor=account['username'])
+        form = (view.get('forms') or {}).get(kind) if kind in ('reject', 'recheck') else None
+        form = form or view.get('recheck_form') or view.get('reject_form') or {}
+        payload = {
+            # 保持旧契约 id/created/rows：这里的 id 是所交原表的数据版本。
+            'id': form.get('dataset_id') or view.get('dataset_id'),
+            'form_id': form.get('id'),
+            'created': view.get('created', status_code == 201),
+            'rows': form.get('row_count'),
+            'shift_id': view.get('id'),
+            'shift': view.get('code'),
+            'shift_code': view.get('code'),
+            'kind': kind or form.get('kind'),
+            'status': view.get('status'),
+            'state': view.get('state'),
+            'status_label': view.get('status_label'),
+            'passed': view.get('passed'),
+            'reconciled': view.get('reconciled'),
+            'complete': view.get('complete'),
+            'closed': view.get('closed'),
+            'mismatch_count': view.get('mismatch_count'),
+            'mismatches': view.get('mismatches'),
+            # 核对通过后整班合并数据版本，分析应绑定它（或直接用 shift）。
+            'dataset_id': view.get('dataset_id'),
+            'analysis_dataset_id': view.get('dataset_id'),
+            'shift_detail': view,
+            'notice': view.get('notice'),
+        }
+        return JSONResponse(payload, status_code=status_code)
+
+    if records is not None:
+        from src.services.data import PROFILE as _profile, convert
+        rows = [{field['key']: convert(row.get(field['key']), field) for field in _profile['columns']}
+                for row in records]
+    else:
+        rows = csv_records(csv_text or '')
+    name = (body.name or '').strip()
+    if not name:
+        raise ValueError('数据名称不能为空。')
+    key, created = save_revision(name, rows, account['username'])
     return {'id': key, 'created': created, 'rows': len(rows)}
 
 
@@ -68,8 +125,13 @@ def list_runs(account=Depends(signed_in)):
 
 
 @router.post('/runs', status_code=202)
-def queue(body: Run, account=Depends(analyst)):
-    return add_run(body, account['username'])
+def queue(body: Run, request: Request, account=Depends(analyst)):
+    idem = (body.idempotency_key or body.request_key
+            or request.headers.get('idempotency-key') or request.headers.get('x-idempotency-key'))
+    result = add_run(body, account['username'], idem)
+    if result.get('idempotent_replay'):
+        return JSONResponse(result, status_code=200)
+    return result
 
 
 @router.get('/runs/{key}')

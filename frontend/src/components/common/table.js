@@ -2,6 +2,7 @@ import {display,esc} from '../../utils/html.js';
 
 function cell(value) {
   if (value && typeof value === 'object' && typeof value.link === 'string') return `<a href="${esc(value.link)}">${esc(value.text)}</a>`;
+  if (value && typeof value === 'object' && typeof value.badge === 'string') return `<span class="badge badge--${esc(value.tone || 'neutral')}">${esc(value.badge)}</span>`;
   if (Array.isArray(value) || (value !== null && typeof value === 'object')) return esc(JSON.stringify(value));
   return esc(display(value) ?? '—');
 }

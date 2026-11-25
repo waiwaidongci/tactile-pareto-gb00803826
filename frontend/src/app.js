@@ -4,6 +4,7 @@ import {bindForm} from './hooks/forms.js';
 import {analysis,bindAnalysis,results} from './pages/analysis.js';
 import {bindDispatch,delivery,review} from './pages/dispatch.js';
 import {bindSource,overview,source} from './pages/source.js';
+import {bindShifts} from './pages/shifts.js';
 import {getRoute} from './router/route.js';
 import {session,state} from './stores/session.js';
 import {esc,formData} from './utils/html.js';
@@ -24,8 +25,9 @@ async function render() {
     },render);
     return;
   }
-  const {section,runId} = getRoute();
+  const {section,runId,shiftKey} = getRoute();
   state.runId = runId;
+  state.shiftKey = shiftKey;
   try {
     const content = await pages[section]();
     if (current !== generation) return;
@@ -33,6 +35,7 @@ async function render() {
     state.status = '';
     root.querySelector('#logout').addEventListener('click',() => {session(null,null); render();});
     bindSource(root,render);
+    bindShifts(root,render);
     bindAnalysis(root,section,render);
     bindDispatch(root,render);
     if (root.querySelector('[data-poll]')) tick = setTimeout(render,850);

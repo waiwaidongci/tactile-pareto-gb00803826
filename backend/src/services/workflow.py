@@ -1,24 +1,81 @@
+import hashlib
+import json
 import time
+from types import SimpleNamespace
 
 from fastapi import HTTPException
 from sqlalchemy import and_, insert, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 from src.constants.enums import State
 from src.models.database import add_event, engine, fetch_one
-from src.models.tables import datasets, deliveries, runs, schedules
+from src.models.tables import datasets, deliveries, idempotency_keys, runs, schedules
 from src.services.data import parse_options
+from src.services.shifts import resolve_runnable_dataset
 
 
-def add_run(body, actor):
+def _request_fingerprint(payload):
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def add_run(body, actor, idempotency_key=None):
     options = parse_options(body.options)
+    shift_ref = (getattr(body, 'shift_id', None) or getattr(body, 'shift', None)
+                 or getattr(body, 'shift_code', None) or getattr(body, 'code', None))
+    if idempotency_key is None:
+        idempotency_key = getattr(body, 'idempotency_key', None) or getattr(body, 'request_key', None)
+    idempotency_key = idempotency_key.strip() if isinstance(idempotency_key, str) and idempotency_key.strip() else None
+    if idempotency_key and len(idempotency_key) > 120:
+        idempotency_key = 'k:' + hashlib.sha256(idempotency_key.encode()).hexdigest()
     now = time.time()
     with engine.begin() as connection:
-        if fetch_one(connection, datasets, body.dataset_id) is None:
+        dataset_id = resolve_runnable_dataset(connection, getattr(body, 'dataset_id', None), shift_ref)
+        if fetch_one(connection, datasets, dataset_id) is None:
             raise HTTPException(404, '数据版本不存在。')
-        key = connection.execute(insert(runs).values(dataset_id=body.dataset_id, options=options,
+        fingerprint = _request_fingerprint({'dataset_id': dataset_id, 'options': options})
+
+        if idempotency_key:
+            reserved = connection.execute(select(idempotency_keys).where(
+                idempotency_keys.c.key == idempotency_key)).mappings().one_or_none()
+            if reserved is not None:
+                if reserved['request_hash'] != fingerprint:
+                    raise HTTPException(409, '同一幂等键已用于不同的数据版本或参数，请更换请求键。')
+                return {'id': reserved['subject_id'], 'state': State.queued.value,
+                        'idempotent_replay': True, 'created': False}
+            try:
+                with connection.begin_nested():
+                    connection.execute(insert(idempotency_keys).values(
+                        key=idempotency_key, actor=actor, scope='run', request_hash=fingerprint,
+                        status_code=202, created=now))
+            except IntegrityError:
+                winner = connection.execute(select(idempotency_keys).where(
+                    idempotency_keys.c.key == idempotency_key)).mappings().one()
+                if winner['request_hash'] != fingerprint:
+                    raise HTTPException(409, '同一幂等键已用于不同的数据版本或参数，请更换请求键。') from None
+                return {'id': winner['subject_id'], 'state': State.queued.value, 'idempotent_replay': True}
+
+        key = connection.execute(insert(runs).values(dataset_id=dataset_id, options=options,
                     state=State.queued.value, owner=actor, created=now)).inserted_primary_key[0]
+        if idempotency_key:
+            connection.execute(update(idempotency_keys).where(idempotency_keys.c.key == idempotency_key)
+                               .values(subject_id=key))
         add_event(connection, actor, 'queue', key, now)
-    return {'id': key, 'state': State.queued.value}
+    return {'id': key, 'state': State.queued.value, 'created': True}
+
+
+def add_shift_run(shift_key, raw_options, actor, idempotency_key=None):
+    """为已核对通过的班次提交分析；同一班次数据版本+参数的重试不新增分析版本。"""
+    options = parse_options(raw_options or {})
+    with engine.connect() as connection:
+        shift = resolve_runnable_dataset(connection, None, shift_key)  # 返回 dataset_id 或 409
+        from src.services.shifts import find_shift
+        row = find_shift(connection, shift_key)
+        shift_id, dataset_id = row['id'], shift
+    fingerprint = _request_fingerprint({'shift': shift_id, 'dataset_id': dataset_id, 'options': options})
+    deterministic_key = idempotency_key or f'shift-run:{shift_id}:{dataset_id}:{fingerprint[:24]}'
+    body = SimpleNamespace(dataset_id=dataset_id, options=options, shift_id=None)
+    return add_run(body, actor, deterministic_key)
 
 
 def claim_run():
